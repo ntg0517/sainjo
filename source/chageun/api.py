@@ -5,6 +5,7 @@
 
 import re
 import secrets
+from datetime import date
 from functools import wraps
 
 import pymysql
@@ -12,7 +13,7 @@ from flask import Blueprint, current_app, g, jsonify, request, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from .repositories import users
+from .repositories import users, vehicles
 from .repositories.db import get_db
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -186,6 +187,159 @@ def me():
         session.clear()
         return fail("AUTH_REQUIRED", "로그인이 필요합니다.", 401)
     return ok({"id": user["id"], "username": user["username"]})
+
+
+VEHICLE_FIELDS = {
+    "manufacturer",
+    "model",
+    "generation",
+    "year",
+    "engine",
+    "fuel",
+    "transmission",
+    "mileage",
+    "reference_date",
+    "conditions",
+}
+VEHICLE_TEXT_LIMITS = {"manufacturer": 40, "model": 40, "engine": 60, "fuel": 30, "transmission": 40}
+VEHICLE_REQUIRED_TEXT = {"manufacturer", "model"}
+VEHICLE_GENERATIONS = {"DL3", "JF"}
+VEHICLE_CONDITIONS = {"normal", "severe", "unknown"}
+YEAR_MIN = 1900
+YEAR_MAX = 2035
+MILEAGE_MAX = 1000000
+DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_int(value):
+    # Python에서 bool은 int의 하위 타입이므로 따로 걸러 냅니다.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _vehicle_fields(body):
+    """입력을 검사해 (저장할 값, 필드별 오류)를 돌려줍니다.
+
+    주행거리·날짜는 없으면 None(모름)으로 저장하고, 0은 0km라는 값이므로 그대로 저장합니다.
+    """
+    fields = {}
+    errors = {}
+    for key in set(body) - VEHICLE_FIELDS:
+        errors[key] = "허용되지 않은 필드입니다."
+
+    for name, limit in VEHICLE_TEXT_LIMITS.items():
+        value = body.get(name)
+        if value is None:
+            text = None
+        elif isinstance(value, str) and len(value.strip()) <= limit:
+            text = value.strip() or None
+        else:
+            errors[name] = f"{limit}자 이하로 입력해 주세요."
+            continue
+        if text is None and name in VEHICLE_REQUIRED_TEXT:
+            errors[name] = "필수 입력입니다."
+        fields[name] = text
+
+    generation = body.get("generation")
+    if generation is None or (isinstance(generation, str) and generation in VEHICLE_GENERATIONS):
+        fields["generation"] = generation
+    else:
+        errors["generation"] = "DL3 또는 JF 중에서 선택해 주세요. 모르면 비워 주세요."
+
+    year = body.get("year")
+    if year is None or (_is_int(year) and YEAR_MIN <= year <= YEAR_MAX):
+        fields["year"] = year
+    else:
+        errors["year"] = f"{YEAR_MIN}~{YEAR_MAX} 사이의 연도를 입력해 주세요. 모르면 비워 주세요."
+
+    mileage = body.get("mileage")
+    if mileage is None or (_is_int(mileage) and 0 <= mileage <= MILEAGE_MAX):
+        fields["mileage"] = mileage
+    else:
+        errors["mileage"] = "0~1,000,000km 사이의 정수로 입력해 주세요. 모르면 비워 주세요."
+
+    reference_date = body.get("reference_date")
+    if reference_date is None:
+        fields["reference_date"] = None
+    elif isinstance(reference_date, str) and DATE_PATTERN.fullmatch(reference_date):
+        try:
+            fields["reference_date"] = date.fromisoformat(reference_date)
+        except ValueError:
+            errors["reference_date"] = "실제 있는 날짜를 YYYY-MM-DD 형식으로 입력해 주세요."
+    else:
+        errors["reference_date"] = "YYYY-MM-DD 형식으로 입력해 주세요. 모르면 비워 주세요."
+
+    conditions = body.get("conditions", "unknown")
+    if isinstance(conditions, str) and conditions in VEHICLE_CONDITIONS:
+        fields["conditions"] = conditions
+    else:
+        errors["conditions"] = "normal, severe, unknown 중에서 선택해 주세요."
+
+    return fields, errors
+
+
+def _vehicle_out(row):
+    reference = row["reference_date"]
+    return {
+        "id": row["id"],
+        "manufacturer": row["manufacturer"],
+        "model": row["model"],
+        "generation": row["generation"],
+        "year": row["year"],
+        "engine": row["engine"],
+        "fuel": row["fuel"],
+        "transmission": row["transmission"],
+        "mileage": row["mileage"],
+        "reference_date": reference.isoformat() if reference is not None else None,
+        "conditions": row["conditions"],
+    }
+
+
+@api.get("/vehicles")
+@login_required
+def vehicle_list():
+    rows = vehicles.list_vehicles_by_owner(session["user_id"])
+    return ok([_vehicle_out(row) for row in rows])
+
+
+@api.post("/vehicles")
+@login_required
+@csrf_protected
+def vehicle_create():
+    body = _json_body()
+    if body is None:
+        return fail("VALIDATION_ERROR", "입력을 확인해 주세요", 400, {})
+    fields, errors = _vehicle_fields(body)
+    if errors:
+        return fail("VALIDATION_ERROR", "입력을 확인해 주세요", 400, errors)
+
+    owner_id = session["user_id"]
+    db = get_db()
+    try:
+        vehicle_id = vehicles.create_vehicle(owner_id, fields)
+        db.commit()
+    except pymysql.err.IntegrityError as error:
+        db.rollback()
+        # vehicles.owner_id의 UNIQUE 제약이 계정당 차량 1대를 보장합니다.
+        if error.args and error.args[0] == DUPLICATE_KEY_ERROR:
+            return fail("CONFLICT", "이미 등록된 차량이 있습니다. 계정당 차량은 1대입니다.", 409)
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    # 저장된 값을 다시 읽어서 응답합니다.
+    row = vehicles.find_vehicle_for_owner(vehicle_id, owner_id)
+    return ok(_vehicle_out(row), 201)
+
+
+@api.get("/vehicles/<int:vehicle_id>")
+@login_required
+def vehicle_detail(vehicle_id):
+    # 다른 계정의 차량이나 없는 차량은 같은 404로 응답합니다.
+    row = vehicles.find_vehicle_for_owner(vehicle_id, session["user_id"])
+    if row is None:
+        return fail("NOT_FOUND", "차량을 찾을 수 없습니다.", 404)
+    return ok(_vehicle_out(row))
 
 
 @api.errorhandler(Exception)
